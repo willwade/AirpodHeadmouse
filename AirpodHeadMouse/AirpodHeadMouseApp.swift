@@ -1,16 +1,9 @@
-//
-//  ContentView.swift
-//  AirpodHeadMouse
-//
-//  Created by willwade on 05/10/2025.
-//
-
 import SwiftUI
 import CoreMotion
 import CoreGraphics
 import Combine
 import AppKit
-import AVFoundation // ADDED: For audio feedback (beeps/buzzes)
+import AVFoundation
 
 // MARK: - Gesture Definition
 enum HeadMouseGesture: Equatable {
@@ -19,7 +12,7 @@ enum HeadMouseGesture: Equatable {
 
 enum MouseMode: Equatable {
     case tracking      // Default mode: Head motion moves cursor position
-    case paused        // Cursor movement is disabled
+    case paused        // Cursor movement is disabled by gesture
     case scrollReady   // Waiting 5 seconds to position scroll target
     case scrolling     // Head motion controls scroll events
     case centering     // Cursor is being moved to the center
@@ -33,9 +26,24 @@ class HeadMouseManager: NSObject, ObservableObject, CMHeadphoneMotionManagerDele
     @Published var motionData: CMDeviceMotion?
     @Published var status: String = "Initializing..."
     @Published var isRunning: Bool = false
-    @Published var isGestureEnabled: Bool = true // User toggle
+    // FIX 3: Gestures off by default
+    @Published var isGestureEnabled: Bool = false
     @Published var currentMode: MouseMode = .tracking
     @Published var gestureSteps: [HeadMouseGesture] = []
+    
+    // New: Keyboard Override State
+    @Published var isSpacebarPaused: Bool = false
+    
+    // Direction Toggles for User Preference
+    @Published var invertXAxis: Bool = false
+    @Published var invertYAxis: Bool = false
+    
+    // Damping and Sensitivity Settings
+    @Published var dampingFactor: Double = 0.8 // Lower value = Smoother/more damped
+    private var dampedDx: Double = 0.0 // State for smoothed X velocity
+    private var dampedDy: Double = 0.0 // State for smoothed Y velocity
+    private let trackingSensitivity: Double = 300.0 // Multiplier for cursor speed
+    private let scrollSensitivity: Double = 3.0 // Multiplier for scroll speed
     
     // Core Motion properties
     private let manager = CMHeadphoneMotionManager()
@@ -51,17 +59,13 @@ class HeadMouseManager: NSObject, ObservableObject, CMHeadphoneMotionManagerDele
     private var scrollReadyTimer: Timer?
     
     // Audio Feedback
+    // NOTE: For simplicity, we use print statements as audio feedback (NSBeep is often problematic in sandboxed macOS apps).
     private var audioPlayer: AVAudioPlayer?
-    
-    // Control constants
-    private let trackingSensitivity: Double = 300.0 // Multiplier for cursor speed
-    private let scrollSensitivity: Double = 3.0 // Multiplier for scroll speed
     
     override init() {
         super.init()
         manager.delegate = self
         checkAvailability()
-        // Initialize audio player for feedback
         setupAudioFeedback()
     }
     
@@ -76,8 +80,7 @@ class HeadMouseManager: NSObject, ObservableObject, CMHeadphoneMotionManagerDele
     }
     
     private func setupAudioFeedback() {
-        // NOTE: NSBeep() is a function from AppKit that produces a system sound.
-        // It is used directly below for gesture feedback.
+        // Initialization for future custom sound implementation, currently uses print statements.
     }
     
     // MARK: - Public Control Methods
@@ -87,6 +90,10 @@ class HeadMouseManager: NSObject, ObservableObject, CMHeadphoneMotionManagerDele
             status = "Motion unavailable."
             return
         }
+        
+        // Reset damping state when starting
+        dampedDx = 0.0
+        dampedDy = 0.0
         
         manager.startDeviceMotionUpdates(to: .main) { [weak self] motion, error in
             guard let self = self else { return }
@@ -117,15 +124,18 @@ class HeadMouseManager: NSObject, ObservableObject, CMHeadphoneMotionManagerDele
         status = "Tracking Stopped."
         scrollReadyTimer?.invalidate()
         scrollReadyTimer = nil
+        isSpacebarPaused = false // Reset keyboard pause
     }
     
     func calibrate() {
+        // FIX 4: Only require motionData to be present for a non-running calibration.
         guard let currentMotion = motionData else {
-            status = "Waiting for initial motion data to calibrate..."
+            status = "Waiting for motion data to calibrate."
             return
         }
+        // Calibration resets the zero point for relative tracking.
         referenceAttitude = currentMotion.attitude
-        status = (currentMode == .tracking || currentMode == .gestureMode) ? "Calibrated. Tracking Head Mouse..." : "Calibrated."
+        status = isRunning ? "Calibrated. Tracking Head Mouse..." : "Calibrated (Start Tracking)."
         isHeadStill = false
         gestureSteps = []
     }
@@ -149,17 +159,38 @@ class HeadMouseManager: NSObject, ObservableObject, CMHeadphoneMotionManagerDele
     
     private func processMotionUpdate(motion: CMDeviceMotion) {
         
-        switch currentMode {
-        case .tracking:
-            moveCursor(motion: motion, sensitivity: trackingSensitivity)
-        case .scrolling:
-            scrollWindow(motion: motion, sensitivity: scrollSensitivity)
-        case .paused, .scrollReady, .centering:
-            // Do nothing, but allow gesture processing
-            break
-        case .gestureMode:
-            // Gesture mode handles cursor movement implicitly if a gesture is not active
-            break
+        let xFactor = invertXAxis ? -1.0 : 1.0
+        let yFactor = invertYAxis ? -1.0 : 1.0
+        
+        // FIX: X-Axis Direction Swap
+        // The * -1.0 factor here corrects the input direction.
+        let rawDx = motion.rotationRate.y * trackingSensitivity * -1.0 * xFactor
+        
+        // FIX: Y-Axis Direction Fix
+        // Pitch (X-axis rotation). Head down (positive pitch) should yield cursor down (positive Y).
+        let rawDy = motion.rotationRate.x * trackingSensitivity * yFactor
+        
+        // Apply smoothing filter regardless of mode (except gesture)
+        let alpha = 1.0 - dampingFactor // 0.2
+        
+        // Exponential Moving Average (EMA) for Smoothing
+        dampedDx = (alpha * rawDx) + ((1.0 - alpha) * dampedDx)
+        dampedDy = (alpha * rawDy) + ((1.0 - alpha) * dampedDy)
+        
+        
+        if isRunning && !isSpacebarPaused { // Check keyboard override first
+            switch currentMode {
+            case .tracking:
+                moveCursor(dx: dampedDx, dy: dampedDy)
+            case .scrolling:
+                scrollWindow(motion: motion, sensitivity: scrollSensitivity)
+            case .paused, .scrollReady, .centering:
+                // Do nothing, but allow gesture processing
+                break
+            case .gestureMode:
+                // Stillness check needed for gesture mode, but no cursor movement
+                break
+            }
         }
         
         if isGestureEnabled {
@@ -167,7 +198,9 @@ class HeadMouseManager: NSObject, ObservableObject, CMHeadphoneMotionManagerDele
         }
         
         // Update status display for complex modes
-        if currentMode == .paused {
+        if isSpacebarPaused {
+            status = "KEYBOARD PAUSED (Control Key Held)"
+        } else if currentMode == .paused {
             status = "Paused Mode Active (Exit: Still 1s → R → L)"
         } else if currentMode == .scrollReady {
             status = "Scroll Ready (5s to position mouse)..."
@@ -177,14 +210,14 @@ class HeadMouseManager: NSObject, ObservableObject, CMHeadphoneMotionManagerDele
             status = "Gesture: Step \(gestureSteps.count + 1). Last: \(gestureSteps.last!)"
         } else if currentMode == .tracking {
             status = "Tracking Active"
+        } else if !isRunning {
+            status = "Tracking Stopped."
         }
     }
     
     // MARK: - Cursor/Scroll Control Logic
     
-    private func moveCursor(motion: CMDeviceMotion, sensitivity: Double) {
-        let dx = motion.rotationRate.y * sensitivity
-        let dy = motion.rotationRate.x * sensitivity * -1.0 // Invert Y for natural motion
+    private func moveCursor(dx: Double, dy: Double) {
         
         guard let event = CGEvent(source: nil) else { return }
         let currentMouseLocation = event.location
@@ -203,21 +236,21 @@ class HeadMouseManager: NSObject, ObservableObject, CMHeadphoneMotionManagerDele
     
     private func scrollWindow(motion: CMDeviceMotion, sensitivity: Double) {
         // Yaw (Y-axis rotation) for horizontal scroll
-        let scrollX = Int(motion.rotationRate.y * sensitivity)
+        let scrollX = Int32(motion.rotationRate.y * sensitivity)
         // Pitch (X-axis rotation) for vertical scroll (Invert Y for natural scroll)
-        let scrollY = Int(motion.rotationRate.x * sensitivity * -1.0)
+        let scrollY = Int32(motion.rotationRate.x * sensitivity * -1.0)
         
-        // FIX: Corrected CGEvent initializer arguments for scroll events
+        // Corrected initializer expected by the current SDK for the argument labels.
         guard let scrollEvent = CGEvent(scrollWheelEvent2Source: nil,
                                         units: .line,
                                         wheelCount: 2,
-                                        wheel1: Int32(scrollY),
-                                        wheel2: Int32(scrollX),
+                                        wheel1: scrollY, // Vertical scroll
+                                        wheel2: scrollX, // Horizontal scroll
                                         wheel3: 0)
         else { return }
         
-        // FIX: Corrected posting the event
-        scrollEvent.post(tap: .cghidEventTap)
+        // Explicitly access the cghidEventTap member using the enum type.
+        scrollEvent.post(tap: CGEventTapLocation.cghidEventTap)
     }
     
     private func centerCursor() {
@@ -250,8 +283,6 @@ class HeadMouseManager: NSObject, ObservableObject, CMHeadphoneMotionManagerDele
                 // If head is still for 1 second, enter gesture mode
                 currentMode = .gestureMode
                 gestureSteps = []
-                status = "Gesture Started: Still 1s."
-                // FIX: Replaced NSBeep() with print() to avoid error
                 print("Gesture Start Beep")
                 return
             }
@@ -260,7 +291,8 @@ class HeadMouseManager: NSObject, ObservableObject, CMHeadphoneMotionManagerDele
         }
         
         // 2. Accumulate Movements (Only when in gesture mode)
-        guard currentMode == .gestureMode else { return }
+        // We temporarily exit gesture mode after a move is recorded to force stillness for the next step.
+        guard currentMode == .gestureMode || currentMode == .tracking else { return }
         
         if maxRate > movementThreshold {
             let currentMove: HeadMouseGesture
@@ -268,23 +300,22 @@ class HeadMouseManager: NSObject, ObservableObject, CMHeadphoneMotionManagerDele
             if yawRate > pitchRate { // Horizontal movement dominates
                 currentMove = motion.rotationRate.y > 0 ? .right : .left
             } else { // Vertical movement dominates
-                currentMove = motion.rotationRate.x > 0 ? .down : .up // Note: Pitch > 0 means rotation down
+                currentMove = motion.rotationRate.x > 0 ? .down : .up // Pitch > 0 means rotation down
             }
             
             // Only register a step if the direction is new (or is the first step)
             if currentMove != lastDirection {
                 gestureSteps.append(currentMove)
                 lastDirection = currentMove
-                // FIX: Replaced NSBeep() with print() to avoid error
-                print("Gesture Step Beep")
+                print("Gesture Step Beep: \(currentMove)")
                 
-                // Reset gesture tracking after registering a step, waiting for stillness again
-                currentMode = .tracking // Temporarily exit gesture mode to allow stillness detection again
+                // Immediately check for pattern match after a step
+                checkPatternMatch()
+                
+                // Transition back to tracking to require stillness for the NEXT step
+                currentMode = .tracking
                 lastMovementTime = Date()
                 isHeadStill = false
-                
-                // 3. Check for pattern match immediately
-                checkPatternMatch()
             }
         }
     }
@@ -308,6 +339,7 @@ class HeadMouseManager: NSObject, ObservableObject, CMHeadphoneMotionManagerDele
                 currentMode = .tracking
                 status = "Exit Gesture Confirmed. Tracking."
                 gestureSteps = []
+                return
             }
         }
         
@@ -316,13 +348,16 @@ class HeadMouseManager: NSObject, ObservableObject, CMHeadphoneMotionManagerDele
                 currentMode = .paused
                 status = "Pause Gesture Confirmed. Paused Mode Active."
                 gestureSteps = []
+                return
             } else if sequence == targetSequences["Scroll"] {
                 startScrollReadyMode()
                 gestureSteps = []
+                return
             } else if sequence == targetSequences["Center"] {
                 centerCursor()
                 status = "Center Gesture Confirmed. Centering Cursor."
                 gestureSteps = []
+                return
             }
         }
         
@@ -335,7 +370,6 @@ class HeadMouseManager: NSObject, ObservableObject, CMHeadphoneMotionManagerDele
     private func startScrollReadyMode() {
         currentMode = .scrollReady
         status = "Scroll Ready. Move cursor over target window (5s)."
-        // FIX: Replaced NSBeep() with print() to avoid error
         print("Scroll Ready Beep")
         
         // Start 5-second timer
@@ -344,7 +378,6 @@ class HeadMouseManager: NSObject, ObservableObject, CMHeadphoneMotionManagerDele
             guard let self = self else { return }
             self.currentMode = .scrolling
             self.status = "Scrolling Mode Active (Exit: Still 1s → R → L)"
-            // FIX: Replaced NSBeep() with print() to avoid error
             print("Scrolling Active Beep")
         }
     }
@@ -354,86 +387,151 @@ class HeadMouseManager: NSObject, ObservableObject, CMHeadphoneMotionManagerDele
 struct ContentView: View {
     @StateObject private var motionManager = HeadMouseManager()
     
+    // FIX 2: Added @FocusState to manage and dismiss the focus ring
+    @FocusState private var isFocused: Bool
+    
     var body: some View {
         VStack(spacing: 16) {
+            
             Text("AirPods Head Mouse")
-                .font(.largeTitle.bold())
+                .font(.title2.bold())
                 .foregroundColor(.accentColor)
             
             // Status and Mode Display
-            VStack(alignment: .leading, spacing: 8) {
+            VStack(alignment: .leading, spacing: 4) {
                 Text("Current Mode:")
-                    .font(.headline)
-                Text("\(modeDescription(motionManager.currentMode))")
+                    .font(.subheadline.weight(.semibold))
+                
+                // Display combined mode status
+                Text(motionManager.isSpacebarPaused ? "KEYBOARD PAUSED" : "\(modeDescription(motionManager.currentMode))")
                     .font(.body)
-                    .padding(8)
+                    .padding(6)
                     .frame(maxWidth: .infinity)
                     .background(
-                        RoundedRectangle(cornerRadius: 8)
-                            .fill(backgroundColor(motionManager.currentMode))
+                        RoundedRectangle(cornerRadius: 6)
+                            .fill(backgroundColor(motionManager.isSpacebarPaused ? .paused : motionManager.currentMode))
                     )
-                    .foregroundColor(motionManager.currentMode == .paused ? .white : .primary)
+                    .foregroundColor(motionManager.isSpacebarPaused ? .white : (motionManager.currentMode == .paused ? .white : .primary))
+                    .lineLimit(1)
             }
             .padding(.horizontal)
             
-            Toggle("Enable Gestures", isOn: $motionManager.isGestureEnabled)
-                .padding(.horizontal)
-                .tint(.purple)
-
-            // Live Motion Data Display
-            if let motion = motionManager.motionData {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Live Rotation Rate (rad/s):")
-                        .font(.headline)
-                    Group {
-                        Text("Pitch (X-axis): \(motion.rotationRate.x, specifier: "%.3f")")
-                        Text("Yaw (Y-axis): \(motion.rotationRate.y, specifier: "%.3f")")
-                        Text("Roll (Z-axis): \(motion.rotationRate.z, specifier: "%.3f")")
-                    }
-                    .font(.system(.body, design: .monospaced))
-                    .padding(.leading)
-                }
-                .padding()
-                .background(Color.secondary.opacity(0.1))
-                .cornerRadius(10)
-            }
-            
-            HStack(spacing: 15) {
-                // Start/Stop Button
+            // Controls
+            HStack(spacing: 10) {
                 Button {
                     motionManager.isRunning ? motionManager.stopTracking() : motionManager.startTracking()
                 } label: {
-                    Text(motionManager.isRunning ? "Stop Mouse" : "Start Mouse")
+                    Text(motionManager.isRunning ? "Stop" : "Start")
                         .frame(maxWidth: .infinity)
                 }
-                .keyboardShortcut(motionManager.isRunning ? .cancelAction : .defaultAction)
                 .controlSize(.large)
                 .tint(motionManager.isRunning ? .red : .accentColor)
                 
-                // Calibrate Button
-                Button {
+                // Calibrate button is enabled as long as motionData is present (FIX 4)
+                Button("Calibrate") {
                     motionManager.calibrate()
-                } label: {
-                    Text("Calibrate")
-                        .frame(maxWidth: .infinity)
                 }
-                .keyboardShortcut("r", modifiers: .command)
                 .controlSize(.large)
                 .tint(.blue)
-                .disabled(!motionManager.isRunning || motionManager.currentMode == .scrolling)
+                .disabled(motionManager.motionData == nil) // Enabled if we have data
             }
-            .padding([.top, .horizontal])
+            .padding(.horizontal)
             
-            Text("Tip: Calibrate when looking straight ahead. Check accessibility permissions!")
-                .font(.caption)
+            // Direction Inversion Toggles
+            VStack(alignment: .leading, spacing: 8) {
+                Toggle("Invert Horizontal (X)", isOn: $motionManager.invertXAxis)
+                    .tint(.blue)
+                Toggle("Invert Vertical (Y)", isOn: $motionManager.invertYAxis)
+                    .tint(.blue)
+            }
+            .padding(.horizontal)
+            
+            // Damping Slider
+            VStack(alignment: .leading) {
+                Text("Damping (Smoothing): \(motionManager.dampingFactor, specifier: "%.2f")")
+                    .font(.subheadline)
+                Slider(value: $motionManager.dampingFactor, in: 0.05...0.95) {
+                    Text("Damping")
+                }
+            }
+            .padding(.horizontal)
+            
+            // Gesture Toggle & Help
+            VStack(alignment: .leading, spacing: 8) {
+                Toggle("Enable Gestures", isOn: $motionManager.isGestureEnabled)
+                    .tint(.purple)
+                
+                // Gesture Help Guide
+                DisclosureGroup("Gesture Quick Reference") {
+                    VStack(alignment: .leading, spacing: 6) {
+                        GestureRow(name: "Pause Mouse", sequence: "Still 1s → R → L → R → L")
+                        GestureRow(name: "Scroll Mode", sequence: "Still 1s → U → D → U → D")
+                        GestureRow(name: "Center Cursor", sequence: "Still 1s → R → L → U → D")
+                        GestureRow(name: "Exit Mode", sequence: "Still 1s → R → L")
+                    }
+                    .font(.caption)
+                    .padding(.top, 4)
+                }
+                .padding(8)
+                .background(Color.secondary.opacity(0.1))
+                .cornerRadius(6)
+                
+            }
+            .padding(.horizontal)
+            
+            Text("Tip: Hold **Control** to temporarily freeze the cursor.")
+                .font(.caption2.bold())
                 .foregroundColor(.secondary)
-                .padding(.horizontal)
+                .padding(.bottom, 4)
+            
+            Text("Tip: Check 'Privacy & Security' > 'Accessibility' for full control.")
+                .font(.caption2)
+                .foregroundColor(.secondary)
+                .padding(.bottom, 4)
         }
-        .padding()
-        .frame(minWidth: 400)
+        .padding(8)
+        .frame(width: 300) // Compact Window Width
+        // MARK: - Keyboard Input Handler
+        .focused($isFocused) // Link focus state to the view
+        .onAppear {
+            isFocused = true // Ensure the view has focus when it appears
+        }
+        // FIX: Use modifiers check for Control key
+        .onKeyPress(phases: .down) { keyPress in
+            guard motionManager.isRunning else { return .ignored }
+            
+            // Check if Control key is the ONLY key modifier pressed
+            guard keyPress.modifiers.contains(.control) else { return .ignored }
+            
+            // Key Down: Pause the tracking
+            motionManager.isSpacebarPaused = true
+            return .handled
+        }
+        .onKeyPress(phases: .up) { keyPress in
+            guard motionManager.isRunning else { return .ignored }
+            
+            // Check if Control key is the ONLY key modifier released
+            guard keyPress.modifiers.contains(.control) else { return .ignored }
+
+            // Key Up: Resume tracking
+            motionManager.isSpacebarPaused = false
+            return .handled
+        }
     }
     
-    // MARK: - Helper Functions
+    // MARK: - Helper Views
+    
+    @ViewBuilder
+    private func GestureRow(name: String, sequence: String) -> some View {
+        HStack {
+            Text(name + ":")
+                .fontWeight(.bold)
+            Spacer()
+            Text(sequence)
+        }
+    }
+    
+    // MARK: - Helper Functions (Re-used)
     
     private func backgroundColor(_ mode: MouseMode) -> Color {
         switch mode {
@@ -447,9 +545,9 @@ struct ContentView: View {
     private func modeDescription(_ mode: MouseMode) -> String {
         switch mode {
         case .tracking: return "NORMAL TRACKING"
-        case .paused: return "PAUSED (Gesture Control Only)"
-        case .scrolling: return "SCROLLING MODE"
-        case .scrollReady: return "SCROLL READY (Move Cursor Now)"
+        case .paused: return "PAUSED (Gesture)"
+        case .scrolling: return "SCROLLING"
+        case .scrollReady: return "SCROLL READY (5S TIMER)"
         case .centering: return "CENTERING"
         case .gestureMode: return "LISTENING FOR GESTURE"
         }
@@ -463,6 +561,7 @@ struct HeadMouseApp: App {
         WindowGroup {
             ContentView()
         }
+        // Force the window to fit the content size (300px wide)
         .windowResizability(.contentSize)
     }
 }
