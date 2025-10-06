@@ -1,3 +1,10 @@
+//
+//  ContentView.swift
+//  AirpodHeadMouse
+//
+//  Created by willwade on 05/10/2025.
+//
+
 import SwiftUI
 import CoreMotion
 import CoreGraphics
