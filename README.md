@@ -3,6 +3,11 @@
 A SwiftUI application for macOS that transforms compatible Apple headphones (AirPods Pro, AirPods Max, or AirPods 3rd Gen) into a head-tracking mouse input device. This project uses Apple's proprietary Core Motion framework to read head rotation data and translates those movements into cursor control on the screen. Warning: Its flaky!
 
 
+
+https://github.com/user-attachments/assets/52accb63-d78a-4bb4-9b01-d1c07ce11c7e
+
+
+
 ## Requirements
 ### Hardware
 
